@@ -1,10 +1,11 @@
-import { BallisticDataPoint, WeaponConfig, BallisticSolution } from '../types';
+import { BallisticDataPoint, WeaponConfig, WeaponCharge, BallisticSolution } from '../types';
 
 export interface InterpolatedBallistics {
   elevation: number;
   timeOfFlight: number;
   peakAlt: number;
   dElevPer100m: number;
+  dHw: number; // Signed Delta H_w (-dElevPer100m for high-angle fire)
   angleImpact: number;
   dispersion: number;
   isExact: boolean;
@@ -30,11 +31,13 @@ export function interpolateBallistics(
   // Check exact match (within 0.05m tolerance)
   const exact = table.find((p) => Math.abs(p.range - targetDistance) < 0.05);
   if (exact) {
+    const dElev = exact.dElevPer100m ?? 30.0;
     return {
       elevation: exact.elevation,
       timeOfFlight: exact.tof,
       peakAlt: exact.peakAlt ?? (1.226 * exact.tof * exact.tof),
-      dElevPer100m: exact.dElevPer100m ?? 30.0,
+      dElevPer100m: dElev,
+      dHw: -Math.abs(dElev),
       angleImpact: exact.angleImpact ?? (exact.elevation * (360 / 6400)),
       dispersion: exact.dispersion ?? 40.0,
       isExact: true,
@@ -44,7 +47,7 @@ export function interpolateBallistics(
   const minRange = table[0].range;
   const maxRange = table[table.length - 1].range;
 
-  // Clamping for edge evaluations or bounds
+  // Range boundary check for interpolation
   if (targetDistance < minRange || targetDistance > maxRange) {
     return null;
   }
@@ -57,11 +60,13 @@ export function interpolateBallistics(
     if (targetDistance >= p1.range && targetDistance <= p2.range) {
       const rangeSpan = p2.range - p1.range;
       if (rangeSpan === 0) {
+        const dElev = p1.dElevPer100m ?? 30.0;
         return {
           elevation: p1.elevation,
           timeOfFlight: p1.tof,
           peakAlt: p1.peakAlt ?? 1000,
-          dElevPer100m: p1.dElevPer100m ?? 30,
+          dElevPer100m: dElev,
+          dHw: -Math.abs(dElev),
           angleImpact: p1.angleImpact ?? 70,
           dispersion: p1.dispersion ?? 40,
           isExact: true,
@@ -82,11 +87,14 @@ export function interpolateBallistics(
       const p1Disp = p1.dispersion ?? 40.0;
       const p2Disp = p2.dispersion ?? 40.0;
 
+      const dElevInterp = p1dElev + (p2dElev - p1dElev) * t;
+
       return {
         elevation: p1.elevation + (p2.elevation - p1.elevation) * t,
         timeOfFlight: p1.tof + (p2.tof - p1.tof) * t,
         peakAlt: p1Peak + (p2Peak - p1Peak) * t,
-        dElevPer100m: p1dElev + (p2dElev - p1dElev) * t,
+        dElevPer100m: dElevInterp,
+        dHw: -Math.abs(dElevInterp),
         angleImpact: p1Angle + (p2Angle - p1Angle) * t,
         dispersion: p1Disp + (p2Disp - p1Disp) * t,
         isExact: false,
@@ -98,18 +106,61 @@ export function interpolateBallistics(
 }
 
 /**
- * Altitude correction (Delta H_w) calculation according to manual formula:
- * Delta Alt = Target Alt - Mortar Alt
- * In mortar high-angle fire (45° to 85°), shooting to a higher altitude requires a flatter tube (lower mils),
- * while shooting into a valley requires a steeper tube (higher mils).
- * Correction = - (Delta Alt / 100) * Delta H_w
+ * Finds all charge rings whose range brackets cover the given target distance.
  */
-export function calculateAltitudeCorrection(deltaAltMeters: number, dElevPer100m: number): number {
-  return - (deltaAltMeters / 100.0) * dElevPer100m;
+export function findValidCharges(weapon: WeaponConfig, distanceMeters: number): WeaponCharge[] {
+  return weapon.charges.filter(
+    (c) => distanceMeters >= c.minRange && distanceMeters <= c.maxRange
+  );
 }
 
 /**
- * Computes high-precision firing solution for mortar systems
+ * Returns explicit tactical guidance if a target distance falls outside a selected charge bracket.
+ * e.g., "Range requires Ring 2" or "Range requires Ring 3 or Ring 4"
+ */
+export function getRequiredChargeWarning(
+  weapon: WeaponConfig,
+  selectedChargeIdx: number,
+  distanceMeters: number
+): string | undefined {
+  const selectedCharge = weapon.charges[selectedChargeIdx];
+  if (!selectedCharge) return 'Invalid charge selected';
+
+  // If in range of current charge, no warning
+  if (distanceMeters >= selectedCharge.minRange && distanceMeters <= selectedCharge.maxRange) {
+    return undefined;
+  }
+
+  // Find charges that can hit this target
+  const valid = findValidCharges(weapon, distanceMeters);
+
+  if (valid.length > 0) {
+    const ringNames = valid.map((c) => `Ring ${c.charge}`).join(' or ');
+    return `Range requires ${ringNames}`;
+  }
+
+  // Outside weapon global min or max
+  const globalMin = Math.min(...weapon.charges.map((c) => c.minRange));
+  const globalMax = Math.max(...weapon.charges.map((c) => c.maxRange));
+
+  if (distanceMeters < globalMin) {
+    return `Target distance (${Math.round(distanceMeters)}m) below minimum range (${globalMin}m)`;
+  }
+  return `Target distance (${Math.round(distanceMeters)}m) exceeds maximum range (${globalMax}m)`;
+}
+
+/**
+ * Altitude correction (Delta H_w) calculation according to official manual formula:
+ * Delta Alt = Target Alt - Mortar Alt
+ * Final Elevation = Base Elevation + (Delta Alt / 100 * Delta H_w)
+ * Where Delta H_w is negative for high-angle mortar fire (flatter tube to reach hilltop, steeper tube into valley).
+ */
+export function calculateAltitudeCorrection(deltaAltMeters: number, dElevPer100m: number): number {
+  return - (deltaAltMeters / 100.0) * Math.abs(dElevPer100m);
+}
+
+/**
+ * Computes high-precision firing solution for mortar systems with dynamic charge table selection
  */
 export function solveMortarFireMission({
   weapon,
@@ -117,6 +168,7 @@ export function solveMortarFireMission({
   targetPos,
   preferredCharge,
 }: CalculateSolutionOptions): BallisticSolution {
+  // Euclidean planar distance (1 meter per coordinate unit)
   const dx = targetPos.x - gunPos.x;
   const dz = targetPos.z - gunPos.z;
   const deltaAlt = targetPos.alt - gunPos.alt;
@@ -124,7 +176,8 @@ export function solveMortarFireMission({
   const horizontalDistance = Math.sqrt(dx * dx + dz * dz);
   const slantDistance = Math.sqrt(horizontalDistance * horizontalDistance + deltaAlt * deltaAlt);
 
-  // Azimuth calculation
+  // Azimuth calculation normalized in weapon's native mil system (6400 NATO or 6000 Soviet)
+  // In Arma Reforger: Z is North (0° / 0 mils), X is East (90° / 1600 or 1500 mils)
   let angleRad = Math.atan2(dx, dz);
   if (angleRad < 0) {
     angleRad += 2 * Math.PI;
@@ -132,41 +185,47 @@ export function solveMortarFireMission({
   const azimuthDeg = (angleRad * 180) / Math.PI;
   const azimuthMils = (angleRad / (2 * Math.PI)) * weapon.milsPerCircle;
 
+  // Determine valid charge rings for this distance
+  const validCharges = findValidCharges(weapon, horizontalDistance);
+
   // Automatic optimal charge selection
   let recommendedCharge = 0;
-  const suitableCharges = weapon.charges
-    .map((c, i) => ({ c, i }))
-    .filter(({ c }) => horizontalDistance >= c.minRange && horizontalDistance <= c.maxRange);
+  if (validCharges.length > 0) {
+    // If target is on the extreme upper edge (> 95% of lowest charge max) and next charge has good angle headroom, prefer next
+    const lowest = validCharges[0];
+    const second = validCharges.length > 1 ? validCharges[1] : null;
 
-  if (suitableCharges.length > 0) {
-    // If target is within 95% of lowest charge max, pick next charge for safer angle headroom
     if (
-      suitableCharges.length > 1 &&
-      horizontalDistance > suitableCharges[0].c.maxRange * 0.95 &&
-      horizontalDistance >= suitableCharges[1].c.minRange + 25
+      second &&
+      horizontalDistance > lowest.maxRange * 0.95 &&
+      horizontalDistance >= second.minRange + 30
     ) {
-      recommendedCharge = suitableCharges[1].i;
+      recommendedCharge = second.charge;
     } else {
-      recommendedCharge = suitableCharges[0].i;
+      recommendedCharge = lowest.charge;
     }
   } else {
     // Outside all charges: choose closest boundary
-    if (horizontalDistance < weapon.charges[0].minRange) {
-      recommendedCharge = 0;
+    const globalMin = Math.min(...weapon.charges.map((c) => c.minRange));
+    if (horizontalDistance < globalMin) {
+      recommendedCharge = weapon.charges[0].charge;
     } else {
-      recommendedCharge = weapon.charges.length - 1;
+      recommendedCharge = weapon.charges[weapon.charges.length - 1].charge;
     }
   }
 
-  // Active charge selection: manual override vs auto
-  let activeChargeIdx = recommendedCharge;
-  if (preferredCharge !== undefined && preferredCharge >= 0 && weapon.charges[preferredCharge]) {
-    activeChargeIdx = preferredCharge;
-  }
+  // Active charge selection:
+  // If preferredCharge is -1 (AUTO), use recommended charge.
+  // If user specified a manual charge (0..4), use it.
+  const isAuto = preferredCharge === undefined || preferredCharge < 0;
+  const activeChargeIdx = isAuto ? recommendedCharge : preferredCharge;
 
-  const selectedChargeObj = weapon.charges[activeChargeIdx] || weapon.charges[0];
+  const selectedChargeObj = weapon.charges.find((c) => c.charge === activeChargeIdx) || weapon.charges[0];
   const table = selectedChargeObj.table;
   const inRange = horizontalDistance >= selectedChargeObj.minRange && horizontalDistance <= selectedChargeObj.maxRange;
+
+  // Check explicit bracket guidance / warnings
+  let warning: string | undefined = getRequiredChargeWarning(weapon, activeChargeIdx, horizontalDistance);
 
   let elevationMils: number | null = null;
   let elevationDeg: number | null = null;
@@ -174,18 +233,8 @@ export function solveMortarFireMission({
   let peakAlt: number | null = null;
   let dElevPer100m: number | null = null;
   let angleImpact: number | null = null;
-  let warning: string | undefined;
 
-  // Strict boundary guard
-  if (!inRange) {
-    if (horizontalDistance < selectedChargeObj.minRange) {
-      warning = `Target below minimum range (${Math.round(selectedChargeObj.minRange)}m) for ${selectedChargeObj.name}`;
-    } else {
-      warning = `Target exceeds maximum range (${Math.round(selectedChargeObj.maxRange)}m) for ${selectedChargeObj.name}`;
-    }
-  }
-
-  // Linear interpolation and altitude correction
+  // Clamp distance to charge table boundaries for evaluation
   const clampedDistance = Math.max(
     selectedChargeObj.minRange,
     Math.min(selectedChargeObj.maxRange, horizontalDistance)
@@ -199,8 +248,8 @@ export function solveMortarFireMission({
     angleImpact = Math.round(interp.angleImpact * 10) / 10;
     timeOfFlight = Math.round(interp.timeOfFlight * 10) / 10;
 
-    // Apply official manual formula:
-    // Corrected Elevation = Interpolated Elevation + (Delta Alt / 100 * Delta H_w)
+    // Apply official manual altitude correction formula:
+    // Final Elevation = Base Elevation + (Delta Alt / 100 * Delta H_w)
     const altitudeCorrection = calculateAltitudeCorrection(deltaAlt, interp.dElevPer100m);
     const unconstrainedElevMils = interp.elevation + altitudeCorrection;
 
